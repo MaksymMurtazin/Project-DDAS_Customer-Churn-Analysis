@@ -1,0 +1,34 @@
+# Два сервіси на одному образі: api (Flask + waitress) і ui (Streamlit).
+# Дані, модель і звіти лежать на хості та монтуються в контейнери, тому
+# навчання в контейнері й запуск без Docker використовують ті самі файли.
+x-churn-image: &churn-image
+  build: .
+  image: churn-project:latest
+
+services:
+  api:
+    <<: *churn-image
+    command: ["python", "-m", "churn.api", "--host", "0.0.0.0", "--port", "5000"]
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./data:/app/data:ro
+      - ./models:/app/models
+      - ./reports:/app/reports
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  ui:
+    <<: *churn-image
+    command: ["python", "-m", "streamlit", "run", "churn/ui.py", "--server.address=0.0.0.0", "--server.port=8501"]
+    environment:
+      CHURN_API_URL: http://api:5000
+    ports:
+      - "8502:8501"
+    depends_on:
+      api:
+        condition: service_healthy
