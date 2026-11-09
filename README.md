@@ -1,0 +1,223 @@
+# Проєкт 4. Аналіз відтоку клієнтів (Customer Churn)
+
+Наскрізна система: дані → підготовка → навчання й порівняння моделей → оцінювання → збережена модель →
+REST API (Flask) → інтерфейс (Streamlit) → прогнози й рекомендації з утримання. Запуск локально (Windows PowerShell)
+та в Docker. Основний датасет — Telco Customer Churn (`data/raw/WA_Fn-UseC_-Telco-Customer-Churn.csv`, 7043 клієнти,
+26,5 % відтоку), навчання працює з локального файлу.
+
+## 1. Структура проєкту
+
+```
+churn-project/
+├── churn/
+│   ├── config.py           # шляхи, параметри експерименту, змінні оточення
+│   ├── schema.py           # колонки, допустимі значення, валідація вхідних даних
+│   ├── data.py             # завантаження й перевірка CSV
+│   ├── features.py         # очищення ознак + sklearn Pipeline (спільний для навчання й прогнозу)
+│   ├── evaluate.py         # метрики, вибір порога, bootstrap-ДІ, калібрування
+│   ├── recommendations.py  # бізнес-правила утримання
+│   ├── train.py            # python -m churn.train
+│   ├── predictor.py        # завантаження моделі та прогноз
+│   ├── predict.py          # python -m churn.predict (CSV → CSV)
+│   ├── api.py              # python -m churn.api
+│   ├── client.py, summary.py   # HTTP-клієнт та агрегації для інтерфейсу
+│   ├── charts.py           # графіки оцінювання моделі
+│   ├── model_view.py       # вкладка «Про модель»
+│   └── ui.py               # python -m streamlit run churn/ui.py
+├── tests/                  # pytest (59 тестів)
+├── data/raw/               # навчальний датасет
+├── data/examples/          # приклади «нових» клієнтів без колонки Churn (new_customers.csv, one_customer.json)
+├── models/                 # сюди зберігається churn_model.joblib
+├── reports/                # звіти навчання (JSON/CSV)
+├── Dockerfile, docker-compose.yml
+├── requirements.txt, requirements-dev.txt
+└── .streamlit/config.toml
+```
+
+## 2. Вимоги
+
+- Windows 10/11, **Python 3.12 або новіший** (потрібен для numpy 2.5 / scipy 1.18; перевірено на 3.12), PowerShell.
+- Для запуску в Docker — Docker Desktop (за бажанням). Git Bash і Make не потрібні.
+- Інтернет потрібен лише для `pip install` (датасет уже в `data/raw/`).
+
+## 3. Локальний запуск (Windows PowerShell)
+
+Усі команди виконуються з кореня проєкту (папка `churn-project`).
+
+```powershell
+# 1. Віртуальне середовище та залежності
+cd churn-project
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+# Якщо PowerShell забороняє виконання скриптів:
+#   Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+python -m pip install --upgrade pip
+python -m pip install -r requirements-dev.txt
+
+# 2. Датасет. Він уже лежить у data\raw\WA_Fn-UseC_-Telco-Customer-Churn.csv.
+#    Якщо файлу немає: завантажте його вручну з
+#    https://www.kaggle.com/datasets/blastchar/telco-customer-churn і покладіть у data\raw\
+#    (або вкажіть інший шлях: python -m churn.train --data D:\шлях\до\файлу.csv)
+Test-Path data\raw\WA_Fn-UseC_-Telco-Customer-Churn.csv
+
+# 3. Навчання (на 1 ядрі ≈ 3–4 хв; створює models\churn_model.joblib і файли в reports\)
+python -m churn.train
+
+# 4. Тести
+python -m pytest -q
+
+# 5. Прогноз для CSV без колонки Churn (без запуску API)
+python -m churn.predict --input data\examples\new_customers.csv --output reports\new_customers_predictions.csv
+```
+
+Запуск системи — у **двох окремих вікнах PowerShell** (в обох спочатку `.\.venv\Scripts\Activate.ps1`):
+
+```powershell
+# Вікно 1 — API (http://127.0.0.1:5000)
+python -m churn.api
+
+# Вікно 2 — інтерфейс (http://localhost:8501)
+python -m streamlit run churn/ui.py
+```
+
+Відкрийте http://localhost:8501. У вкладці «Пакетний аналіз» завантажте `data\examples\new_customers.csv`
+(20 клієнтів з відкладеної тестової вибірки, без `Churn`). Файл `data\raw\…csv` теж можна завантажити, але
+він містить навчальних клієнтів, тож зведені цифри не є оцінкою якості.
+
+Перевірка API з PowerShell (потрібне вікно 1):
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:5000/health
+$body = Get-Content data\examples\one_customer.json -Raw
+Invoke-RestMethod -Uri http://127.0.0.1:5000/predict -Method Post -ContentType "application/json" -Body $body | ConvertTo-Json -Depth 6
+```
+
+Зміна адреси API для інтерфейсу: `$env:CHURN_API_URL = "http://127.0.0.1:5000"`. Інші змінні:
+`CHURN_MODEL_PATH`, `CHURN_DATA_PATH`, `CHURN_REPORTS_DIR`, `CHURN_API_HOST`, `CHURN_API_PORT`.
+Якщо модель ще не навчена, API стартує й відповідає 503 з підказкою; після `python -m churn.train` він підхоплює
+нову модель без перезапуску.
+
+## 4. Запуск у Docker
+
+```powershell
+# Образ збирається один раз і використовується для api, ui та навчання
+docker compose build
+
+# Навчання всередині контейнера (читає ./data, пише в ./models і ./reports на хості)
+docker compose run --rm api python -m churn.train
+
+# Запуск API (порт 5000) та інтерфейсу (порт 8502)
+docker compose up
+# → http://localhost:8502     зупинка: Ctrl+C, потім  docker compose down
+```
+
+Контейнери монтують ті самі `data/`, `models/`, `reports/`, що й локальний запуск, тому модель, навчена локально,
+має працювати в контейнері й навпаки (версії бібліотек в образі беруться з `requirements.txt`; якщо файл моделі не
+сумісний з оточенням, API повідомить про необхідність перенавчання).
+
+## 5. API
+
+| Метод | Шлях | Призначення |
+|---|---|---|
+| GET | `/health` | `{"status":"ok","model_loaded":true/false,"message":…}` |
+| GET | `/model/info` | метадані: модель, поріг, метрики, порівняння моделей, важливість ознак |
+| POST | `/predict` | JSON-об'єкт клієнта → `{"result": {...}, "model": {...}}` |
+| POST | `/predict/batch` | `{"customers":[{...},…]}` (до 10 000) → `{"count":n,"results":[…]}` |
+
+Вхід — поля датасету Telco: `gender, SeniorCitizen, Partner, Dependents, tenure, PhoneService, MultipleLines,
+InternetService, OnlineSecurity, OnlineBackup, DeviceProtection, TechSupport, StreamingTV, StreamingMovies, Contract,
+PaperlessBilling, PaymentMethod, MonthlyCharges, TotalCharges`. `Churn` не потрібен (ігнорується), `customerID` —
+необов'язковий. `TotalCharges` може бути порожнім (тоді береться `tenure × MonthlyCharges`). Приклад: `data/examples/one_customer.json`.
+
+Відповідь для клієнта:
+
+```json
+{
+  "customerID": "6284-KMNUF",
+  "churn_probability": 0.2269,
+  "at_risk": true,
+  "risk_level": "medium",
+  "recommendations": [
+    {"rule_id": "no_tech_support", "action": "…", "segment": "…", "segment_churn_rate": 0.42, "segment_size": 2771}
+  ]
+}
+```
+
+- `churn_probability`, `at_risk` (≥ поріг) і `risk_level` (`low` < поріг ≤ `medium` < 0,5 ≤ `high`) — **результат моделі**.
+- `recommendations` — **результат правил**, не моделі; формується лише для клієнтів із `at_risk = true`.
+- Помилки: 400 (некоректний JSON), 422 (`validation_error` з `details: [{row, column, message}]`; `row` — позиція з 0),
+  413 (завеликий пакет), 503 (модель відсутня/не завантажується), 500 (внутрішня помилка, деталі в журналі сервера).
+
+## 6. Методологія
+
+1. **Поділ**: стратифікований 80/20 (`random_state=42`). Тест не використовується до кінця.
+2. **Обробка ознак** — частина `Pipeline` (`prepare_features` → імпутація/масштабування/one-hot → модель). Медіани,
+   середні й категорії вчаться лише на навчальній частині кожного fold. Той самий збережений Pipeline використовують
+   навчання, API, CLI й інтерфейс. Порожній `TotalCharges` (11 клієнтів із `tenure = 0`) заповнюється
+   детерміновано як `tenure × MonthlyCharges`. `customerID` у модель не потрапляє.
+3. **Підбір і порівняння**: для кожної моделі 20 випадкових комбінацій гіперпараметрів, 5-кратна стратифікована CV
+   **лише на train**; вибір за середнім ROC-AUC. Похідні ознаки (кількість додаткових послуг, різниця платежів) перевірено
+   на train-CV: приросту немає, тому не використано.
+4. **Поріг рішення**: обирається за мінімумом умовної вартості помилок `cost_fn × FN + cost_fp × FP` на out-of-fold прогнозах 
+   навчальної вибірки.
+   Основний навчальний сценарій — FN:FP = 5:1: пропущений відтік має вп'ятеро більшу вагу, ніж хибна тривога. Це припущення 
+   для демонстрації компромісу між виявленням відтоку та кількістю хибних тривог, а не виміряні витрати компанії. 
+   Воно не виводиться з твердження «5–10 разів» у program.pdf. Отриманий поріг — 0,17. Ваги можна змінювати параметрами 
+   `--cost-fn` і `--cost-fp`; поріг при цьому слід знову обирати на навчальних даних. Тестова вибірка не використовується
+   для вибору ваг або порога.
+5. **Оцінювання на тесті — один раз**: ROC-AUC/PR-AUC з bootstrap-ДІ (1000 повторів), Brier, log-loss, калібрування по
+   децилях, метрики за порогом, вартість проти тривіальних стратегій, permutation importance. Тест не впливав ні на вибір
+   моделі, ні на гіперпараметри, ні на поріг.
+6. **Відтворюваність**: фіксовані seed, `deterministic=True` у LightGBM; у `reports/training_report.json` зберігаються
+   версії бібліотек і SHA-256 датасету.
+
+## 7. Результати (фактичний запуск `python -m churn.train`, Linux, Python 3.12.3)
+
+Порівняння на крос-валідації (train, 5 folds):
+
+| Модель | ROC-AUC | PR-AUC | Brier |
+|---|---|---|---|
+| Бейзлайн (частота класу) | 0,5000 | 0,2654 | 0,1949 |
+| LogisticRegression | 0,8464 ± 0,0128 | 0,6614 | 0,1350 |
+| RandomForest | 0,8484 ± 0,0101 | 0,6635 | 0,1350 |
+| **LightGBM (обрана)** | **0,8502 ± 0,0120** | 0,6731 | 0,1332 |
+
+Різниця між моделями менша за розкид по folds — вибір LightGBM помірно обґрунтований; усі три моделі практично рівні.
+
+Тестова вибірка (1409 клієнтів, поріг 0,17):
+
+| Метрика | Значення |
+|---|---|
+| ROC-AUC | 0,8476 (95 % ДІ 0,826–0,868) |
+| PR-AUC | 0,6634 (95 % ДІ 0,611–0,710); базова частка відтоку 0,265 |
+| Brier / log-loss | 0,1348 / 0,4135 |
+| Precision / Recall / F1 | 0,460 / 0,869 / 0,601 |
+| Позначено «у зоні ризику» | 50,2 % клієнтів |
+| Вартість помилок | 627 (проти 1870 «нікого не втримувати» і 1035 «втримувати всіх») |
+
+Чесно про компроміс: за вартості FN:FP = 5:1 система позначає половину клієнтів, а точність лише 46 %. Це наслідок
+припущення про вартості; за порогу 0,5 було б precision 0,65, recall 0,52 і менша економія (вартість 998). Найважливіші
+ознаки (permutation importance, падіння ROC-AUC): `Contract` (0,070), `tenure` (0,053), `InternetService` (0,011).
+
+## 8. Рекомендації (правила, не модель)
+
+Спрацьовують лише для клієнтів «у зоні ризику». Частки відтоку — по навчальній вибірці (середня 26,5 %); це кореляції,
+а не доведений ефект втручань.
+
+| Правило | Сегмент | Відтік у сегменті |
+|---|---|---|
+| `month_to_month` | контракт «місяць за місяцем» | 42,7 % |
+| `no_tech_support` | інтернет-клієнти без техпідтримки | 41,8 % |
+| `no_online_security` | інтернет-клієнти без онлайн-безпеки | 41,9 % |
+| `electronic_check` | оплата електронним чеком | 45,7 % |
+| `high_monthly_charge` | платіж > 90,0 (75-й перцентиль train) | 33,3 % |
+| `new_customer` | стаж ≤ 12 міс. | 47,3 % |
+
+## 9. Тести
+
+`python -m pytest -q` (59 тестів) перевіряють: схему й валідацію (у т.ч. реальний CSV), підготовку ознак, метрики
+й вибір порога, правила рекомендацій, відсутність перетину train/test, збереження та повторне завантаження моделі,
+відтворюваність навчання, прогноз без цільової змінної (один клієнт і пакет), API (успіх, 400/404/405/422/503, підхоплення
+моделі, що з'явилась пізніше, пошкоджений файл моделі), CLI, HTTP-клієнт, агрегації й інтерфейс (`streamlit.testing`
+проти справжнього HTTP-сервера). Тести навчаються на **синтетичних** даних тієї ж схеми для швидкості;
+реальний датасет перевіряється тестом схеми та командою `python -m churn.train`.
